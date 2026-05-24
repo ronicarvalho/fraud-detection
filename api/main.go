@@ -38,7 +38,7 @@ func main() {
 
 	server := &fasthttp.Server{
 		Handler:            handler,
-		Name:               "fraud-detector",
+		Name:               "fraud-detector-api",
 		MaxConnsPerIP:      4096,
 		MaxRequestBodySize: 64 * 1024,
 		ReadTimeout:        5 * time.Second,
