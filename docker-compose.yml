@@ -3,25 +3,31 @@ services:
     image: rpxc/fraud-detector-api:latest
     environment:
       - INSTANCE_ID=1
+      - GOMAXPROCS=1
+      - GOMEMLIMIT=130MiB
+      - GOGC=75
     networks:
       - rinha-net
     deploy:
       resources:
         limits:
-          cpus: "0.45"
-          memory: "150MB"
+          cpus: "0.40"
+          memory: "145MB"
 
   api-2:
     image: rpxc/fraud-detector-api:latest
     environment:
       - INSTANCE_ID=2
+      - GOMAXPROCS=1
+      - GOMEMLIMIT=130MiB
+      - GOGC=75
     networks:
       - rinha-net
     deploy:
       resources:
         limits:
-          cpus: "0.45"
-          memory: "150MB"
+          cpus: "0.40"
+          memory: "145MB"
 
   nginx:
     image: nginx:1.25-alpine
@@ -37,8 +43,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10"
-          memory: "50MB"
+          cpus: "0.20"
+          memory: "40MB"
 
 networks:
   rinha-net:
