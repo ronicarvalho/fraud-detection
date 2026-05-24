@@ -65,7 +65,7 @@ docker compose up          # sobe nginx + 2 APIs
 curl http://localhost:9999/ready
 curl -X POST http://localhost:9999/fraud-score \
   -H 'content-type: application/json' \
-  --data @data/example-payloads.json  # use uma das transações de exemplo
+  --data data/example-payloads.json  # use uma das transações de exemplo, existem várias no array
 ```
 
 O Dockerfile detecta se `data/references.json.gz` existe e roda o preprocessador no build; caso contrário, gera um dataset sintético de 100 k entradas para teste.
