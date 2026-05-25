@@ -94,8 +94,7 @@ func fraudScoreHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	vec := normalize(req, cfg)
-	fraudCount := ds.FraudCountTop5(&vec)
-	score := float32(fraudCount) / 5.0
+	score := ds.FraudScore(&vec)
 
 	res := Response{
 		Approved:   score < 0.6,

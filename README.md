@@ -13,9 +13,9 @@ Submissão para o desafio [Rinha de Backend 2026 — Fraud Detection via Vector 
 A API expõe `POST /fraud-score`. Para cada transação:
 
 1. **Normaliza** o payload em um vetor de 14 dimensões (ordem fixa pela spec) usando as constantes de `data/normalization.json` e o lookup de `data/mcc_risk.json`.
-2. **Quantiza** cada dimensão de `float32 [-1, 1]` para `int8 [-127, 127]` (o `-1` continua significando "sem `last_transaction`").
+2. **Quantiza** cada dimensão de `float32 [-1, 1]` para `int16 [-10000, 10000]` (o `-10000` continua significando "sem `last_transaction`"). 10 000 níveis por dimensão evitam o ruído de quantização que int8 introduzia em casos limítrofes.
 3. **Busca os 5 vizinhos mais próximos** no dataset de referência (3 milhões de vetores) usando distância euclidiana ao quadrado.
-4. **Vota**: `fraud_score = fraud_count / 5`; `approved = fraud_score < 0.6`.
+4. **Vota**: `fraud_score = fraud_count / 5`; `approved = fraud_score < 0.6` (literal da spec).
 
 ## Arquitetura do índice — IVF (Inverted File)
 
@@ -28,13 +28,13 @@ Resultado: ~109× de speedup no KNN puro e p99 ~2 ms ponta-a-ponta (vs 94 ms com
 
 ## Layout binário do dataset
 
-Tudo cabe em ~45 MB, mmap'ado e compartilhável entre as duas instâncias via page cache do kernel:
+Tudo cabe em ~87 MB, mmap'ado e compartilhável entre as duas instâncias via page cache do kernel:
 
 ```
-Header (32 bytes):  magic "IVF1" | version | n_entries | n_clusters | n_dims
-Centroides:         n_clusters × 14 bytes (int8)
+Header (32 bytes):  magic "IVF2" | version | n_entries | n_clusters | n_dims
+Centroides:         n_clusters × 28 bytes (14 × int16 LE)
 Offsets:            (n_clusters + 1) × uint32  (início de cada cluster)
-Entries:            n_entries × 15 bytes (14 int8 + 1 byte label)
+Entries:            n_entries × 30 bytes (14×int16 + 1 byte label + 1 byte pad)
 ```
 
 ## Estrutura
@@ -43,7 +43,7 @@ Entries:            n_entries × 15 bytes (14 int8 + 1 byte label)
 api/
   main.go              # boot: carrega config, mmap dataset, sobe fasthttp
   handler.go           # rotas /ready e /fraud-score, structs do payload
-  vector.go            # 14 dimensões + quantização int8
+  vector.go            # 14 dimensões + quantização int16 (Scale=10000)
   dataset.go           # mmap + busca IVF em 2 etapas
   config.go            # leitura de mcc_risk.json e normalization.json
   cmd/preprocess/      # k-means + writer do references.bin

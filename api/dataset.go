@@ -6,22 +6,24 @@ import (
 	"math"
 	"os"
 	"syscall"
+	"unsafe"
 )
 
 const (
-	IVFMagic   = uint32(0x31465649) // "IVF1"
+	IVFMagic   = uint32(0x32465649) // "IVF2" — int16 layout, breaks old IVF1 binaries
 	HeaderSize = 32
-	EntrySize  = 15
 	NumDims    = 14
+	DimBytes   = NumDims * 2 // 28
+	EntrySize  = DimBytes + 2 // 30: 14*int16 + 1 label + 1 pad (keeps int16 alignment per-entry)
 	LabelFraud = 1
 	LabelLegit = 0
-	K          = 5  // top-K nearest neighbors returned
-	NPROBE     = 16 // number of clusters to scan per query
+	K          = 5
+	NPROBE     = 16
 )
 
 type Dataset struct {
 	raw       []byte   // entire mmap region
-	centroids []byte   // [nClusters * NumDims] int8 raw
+	centroids []byte   // [nClusters * DimBytes] int16 LE raw
 	offsets   []uint32 // [nClusters + 1] start of each cluster (in entries)
 	body      []byte   // [n * EntrySize] entries, grouped by cluster
 	n         int
@@ -63,7 +65,7 @@ func LoadDataset(path string) (*Dataset, error) {
 	}
 
 	centStart := HeaderSize
-	centEnd := centStart + nClusters*NumDims
+	centEnd := centStart + nClusters*DimBytes
 	offStart := centEnd
 	offEnd := offStart + (nClusters+1)*4
 	bodyStart := offEnd
@@ -99,16 +101,14 @@ func (d *Dataset) Close() error {
 	return err
 }
 
-func (d *Dataset) Len() int        { return d.n }
-func (d *Dataset) NClusters() int  { return d.nClusters }
+func (d *Dataset) Len() int       { return d.n }
+func (d *Dataset) NClusters() int { return d.nClusters }
 
-// FraudCountTop5 finds the K=5 nearest neighbors via IVF (NPROBE clusters),
-// using squared Euclidean distance in int8-quantized space, and returns the
-// number of fraud-labeled entries among them.
-func (d *Dataset) FraudCountTop5(query *Vector) int {
+// FraudScore returns n_fraud_in_top5 / 5 (simple majority vote, matching the spec).
+func (d *Dataset) FraudScore(query *Vector) float32 {
 	probes := d.topProbes(query)
 
-	var topDist [K]int32
+	var topDist [K]int64
 	var topLabel [K]byte
 	filled := 0
 
@@ -121,57 +121,42 @@ func (d *Dataset) FraudCountTop5(query *Vector) int {
 		filled = scanRange(d.body, query, start, end, &topDist, &topLabel, filled)
 	}
 
-	fraud := 0
+	if filled == 0 {
+		return 0
+	}
+
+	var fraudCount int
 	for i := 0; i < filled; i++ {
 		if topLabel[i] == LabelFraud {
-			fraud++
+			fraudCount++
 		}
 	}
-	return fraud
+	return float32(fraudCount) / float32(filled)
 }
 
-// topProbes returns the NPROBE cluster indices closest to query.
 func (d *Dataset) topProbes(query *Vector) [NPROBE]uint32 {
-	q0 := int32(query[0])
-	q1 := int32(query[1])
-	q2 := int32(query[2])
-	q3 := int32(query[3])
-	q4 := int32(query[4])
-	q5 := int32(query[5])
-	q6 := int32(query[6])
-	q7 := int32(query[7])
-	q8 := int32(query[8])
-	q9 := int32(query[9])
-	q10 := int32(query[10])
-	q11 := int32(query[11])
-	q12 := int32(query[12])
-	q13 := int32(query[13])
+	q := [NumDims]int64{
+		int64(query[0]), int64(query[1]), int64(query[2]), int64(query[3]),
+		int64(query[4]), int64(query[5]), int64(query[6]), int64(query[7]),
+		int64(query[8]), int64(query[9]), int64(query[10]), int64(query[11]),
+		int64(query[12]), int64(query[13]),
+	}
 
 	var topIdx [NPROBE]uint32
-	var topDist [NPROBE]int32
+	var topDist [NPROBE]int64
 	filled := 0
-	worst := int32(math.MaxInt32)
+	worst := int64(math.MaxInt64)
 
 	cents := d.centroids
 	for c := 0; c < d.nClusters; c++ {
-		off := c * NumDims
-		d0 := q0 - int32(int8(cents[off+0]))
-		d1 := q1 - int32(int8(cents[off+1]))
-		d2 := q2 - int32(int8(cents[off+2]))
-		d3 := q3 - int32(int8(cents[off+3]))
-		d4 := q4 - int32(int8(cents[off+4]))
-		d5 := q5 - int32(int8(cents[off+5]))
-		d6 := q6 - int32(int8(cents[off+6]))
-		d7 := q7 - int32(int8(cents[off+7]))
-		d8 := q8 - int32(int8(cents[off+8]))
-		d9 := q9 - int32(int8(cents[off+9]))
-		d10 := q10 - int32(int8(cents[off+10]))
-		d11 := q11 - int32(int8(cents[off+11]))
-		d12 := q12 - int32(int8(cents[off+12]))
-		d13 := q13 - int32(int8(cents[off+13]))
-
-		sum := d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 + d5*d5 + d6*d6 +
-			d7*d7 + d8*d8 + d9*d9 + d10*d10 + d11*d11 + d12*d12 + d13*d13
+		// read 14 int16 LE values from cents[c*28 : c*28+28]
+		base := unsafe.Pointer(&cents[c*DimBytes])
+		var sum int64
+		for j := 0; j < NumDims; j++ {
+			v := int64(*(*int16)(unsafe.Pointer(uintptr(base) + uintptr(j*2))))
+			diff := q[j] - v
+			sum += diff * diff
+		}
 
 		if filled < NPROBE {
 			topIdx[filled] = uint32(c)
@@ -197,44 +182,26 @@ func (d *Dataset) topProbes(query *Vector) [NPROBE]uint32 {
 
 func scanRange(
 	body []byte, query *Vector, start, end int,
-	topDist *[K]int32, topLabel *[K]byte, filled int,
+	topDist *[K]int64, topLabel *[K]byte, filled int,
 ) int {
-	q0 := int32(query[0])
-	q1 := int32(query[1])
-	q2 := int32(query[2])
-	q3 := int32(query[3])
-	q4 := int32(query[4])
-	q5 := int32(query[5])
-	q6 := int32(query[6])
-	q7 := int32(query[7])
-	q8 := int32(query[8])
-	q9 := int32(query[9])
-	q10 := int32(query[10])
-	q11 := int32(query[11])
-	q12 := int32(query[12])
-	q13 := int32(query[13])
+	q := [NumDims]int64{
+		int64(query[0]), int64(query[1]), int64(query[2]), int64(query[3]),
+		int64(query[4]), int64(query[5]), int64(query[6]), int64(query[7]),
+		int64(query[8]), int64(query[9]), int64(query[10]), int64(query[11]),
+		int64(query[12]), int64(query[13]),
+	}
 
 	for i := start; i < end; i++ {
 		off := i * EntrySize
-		d0 := q0 - int32(int8(body[off+0]))
-		d1 := q1 - int32(int8(body[off+1]))
-		d2 := q2 - int32(int8(body[off+2]))
-		d3 := q3 - int32(int8(body[off+3]))
-		d4 := q4 - int32(int8(body[off+4]))
-		d5 := q5 - int32(int8(body[off+5]))
-		d6 := q6 - int32(int8(body[off+6]))
-		d7 := q7 - int32(int8(body[off+7]))
-		d8 := q8 - int32(int8(body[off+8]))
-		d9 := q9 - int32(int8(body[off+9]))
-		d10 := q10 - int32(int8(body[off+10]))
-		d11 := q11 - int32(int8(body[off+11]))
-		d12 := q12 - int32(int8(body[off+12]))
-		d13 := q13 - int32(int8(body[off+13]))
+		base := unsafe.Pointer(&body[off])
+		var sum int64
+		for j := 0; j < NumDims; j++ {
+			v := int64(*(*int16)(unsafe.Pointer(uintptr(base) + uintptr(j*2))))
+			diff := q[j] - v
+			sum += diff * diff
+		}
+		label := body[off+DimBytes]
 
-		sum := d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 + d5*d5 + d6*d6 +
-			d7*d7 + d8*d8 + d9*d9 + d10*d10 + d11*d11 + d12*d12 + d13*d13
-
-		label := body[off+14]
 		if filled < K {
 			topDist[filled] = sum
 			topLabel[filled] = label
@@ -255,7 +222,7 @@ func scanRange(
 	return filled
 }
 
-func siftDown(dist *[K]int32, label *[K]byte, i int) {
+func siftDown(dist *[K]int64, label *[K]byte, i int) {
 	for {
 		l := 2*i + 1
 		if l >= K {
@@ -274,7 +241,7 @@ func siftDown(dist *[K]int32, label *[K]byte, i int) {
 	}
 }
 
-func siftDownProbes(dist *[NPROBE]int32, idx *[NPROBE]uint32, i int) {
+func siftDownProbes(dist *[NPROBE]int64, idx *[NPROBE]uint32, i int) {
 	for {
 		l := 2*i + 1
 		if l >= NPROBE {

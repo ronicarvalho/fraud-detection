@@ -16,10 +16,12 @@ import (
 )
 
 const (
-	IVFMagic   = uint32(0x31465649) // "IVF1"
+	IVFMagic   = uint32(0x32465649) // "IVF2"
 	HeaderSize = 32
-	EntrySize  = 15
 	NumDims    = 14
+	DimBytes   = NumDims * 2 // 28
+	EntrySize  = DimBytes + 2 // 30 (28 vector + 1 label + 1 pad)
+	Scale      = 10000
 )
 
 type refEntry struct {
@@ -30,13 +32,13 @@ type refEntry struct {
 func main() {
 	synthN := flag.Int("synth", 0, "if >0, generate N synthetic entries instead of reading input")
 	k := flag.Int("k", 2048, "number of IVF clusters")
-	iters := flag.Int("iters", 30, "k-means iterations")
+	iters := flag.Int("iters", 60, "k-means iterations")
 	batchSize := flag.Int("batch", 8192, "mini-batch size per iteration")
 	flag.Parse()
 
 	args := flag.Args()
 	var outPath string
-	var entries [][NumDims]int8
+	var entries [][NumDims]int16
 	var labels []byte
 
 	switch {
@@ -77,7 +79,7 @@ func main() {
 	}
 }
 
-func loadGzip(path string) ([][NumDims]int8, []byte, error) {
+func loadGzip(path string) ([][NumDims]int16, []byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err
@@ -98,7 +100,7 @@ func loadGzip(path string) ([][NumDims]int8, []byte, error) {
 		return nil, nil, fmt.Errorf("expected '[', got %v", tok)
 	}
 
-	entries := make([][NumDims]int8, 0, 3_100_000)
+	entries := make([][NumDims]int16, 0, 3_100_000)
 	labels := make([]byte, 0, 3_100_000)
 	var n int
 	for dec.More() {
@@ -109,9 +111,9 @@ func loadGzip(path string) ([][NumDims]int8, []byte, error) {
 		if len(e.Vector) != NumDims {
 			return nil, nil, fmt.Errorf("entry %d: %d dims, want %d", n, len(e.Vector), NumDims)
 		}
-		var v [NumDims]int8
+		var v [NumDims]int16
 		for j := 0; j < NumDims; j++ {
-			v[j] = quantize(e.Vector[j])
+			v[j] = quantizeRef(e.Vector[j])
 		}
 		entries = append(entries, v)
 		labels = append(labels, labelByte(e.Label))
@@ -123,13 +125,13 @@ func loadGzip(path string) ([][NumDims]int8, []byte, error) {
 	return entries, labels, nil
 }
 
-func genSynth(n int) ([][NumDims]int8, []byte) {
+func genSynth(n int) ([][NumDims]int16, []byte) {
 	rng := rand.New(rand.NewSource(42))
-	entries := make([][NumDims]int8, n)
+	entries := make([][NumDims]int16, n)
 	labels := make([]byte, n)
 	for i := 0; i < n; i++ {
 		for j := 0; j < NumDims; j++ {
-			entries[i][j] = quantize(rng.Float32())
+			entries[i][j] = quantizeRef(rng.Float32())
 		}
 		if rng.Float32() < 0.2 {
 			labels[i] = 1
@@ -138,8 +140,8 @@ func genSynth(n int) ([][NumDims]int8, []byte) {
 	return entries, labels
 }
 
-// trainKMeans runs mini-batch online k-means in float32 and returns int8 centroids.
-func trainKMeans(data [][NumDims]int8, k, iters, batchSize int) [][NumDims]int8 {
+// trainKMeans runs mini-batch online k-means in float32 and returns int16 centroids.
+func trainKMeans(data [][NumDims]int16, k, iters, batchSize int) [][NumDims]int16 {
 	rng := rand.New(rand.NewSource(1))
 
 	centroids := make([][NumDims]float32, k)
@@ -166,23 +168,23 @@ func trainKMeans(data [][NumDims]int8, k, iters, batchSize int) [][NumDims]int8 
 		}
 	}
 
-	out := make([][NumDims]int8, k)
+	out := make([][NumDims]int16, k)
 	for c := 0; c < k; c++ {
 		for j := 0; j < NumDims; j++ {
 			v := centroids[c][j]
-			if v < -127 {
-				out[c][j] = -127
-			} else if v > 127 {
-				out[c][j] = 127
+			if v < -Scale {
+				out[c][j] = -Scale
+			} else if v > Scale {
+				out[c][j] = Scale
 			} else {
-				out[c][j] = int8(math.Round(float64(v)))
+				out[c][j] = int16(math.Round(float64(v)))
 			}
 		}
 	}
 	return out
 }
 
-func nearestF32(x *[NumDims]int8, centroids [][NumDims]float32) int {
+func nearestF32(x *[NumDims]int16, centroids [][NumDims]float32) int {
 	bestIdx := 0
 	bestDist := float32(math.MaxFloat32)
 	for c := 0; c < len(centroids); c++ {
@@ -199,13 +201,13 @@ func nearestF32(x *[NumDims]int8, centroids [][NumDims]float32) int {
 	return bestIdx
 }
 
-func nearestI8(x *[NumDims]int8, centroids [][NumDims]int8) int {
+func nearestI16(x *[NumDims]int16, centroids [][NumDims]int16) int {
 	bestIdx := 0
-	bestDist := int32(math.MaxInt32)
+	bestDist := int64(math.MaxInt64)
 	for c := 0; c < len(centroids); c++ {
-		var sum int32
+		var sum int64
 		for j := 0; j < NumDims; j++ {
-			d := int32(centroids[c][j]) - int32(x[j])
+			d := int64(centroids[c][j]) - int64(x[j])
 			sum += d * d
 		}
 		if sum < bestDist {
@@ -217,7 +219,7 @@ func nearestI8(x *[NumDims]int8, centroids [][NumDims]int8) int {
 }
 
 // assignAll computes the nearest centroid index for every entry, in parallel.
-func assignAll(data [][NumDims]int8, centroids [][NumDims]int8) []uint32 {
+func assignAll(data [][NumDims]int16, centroids [][NumDims]int16) []uint32 {
 	n := len(data)
 	out := make([]uint32, n)
 	workers := runtime.NumCPU()
@@ -240,7 +242,7 @@ func assignAll(data [][NumDims]int8, centroids [][NumDims]int8) []uint32 {
 		go func(start, end int) {
 			defer wg.Done()
 			for i := start; i < end; i++ {
-				out[i] = uint32(nearestI8(&data[i], centroids))
+				out[i] = uint32(nearestI16(&data[i], centroids))
 			}
 		}(start, end)
 	}
@@ -250,8 +252,8 @@ func assignAll(data [][NumDims]int8, centroids [][NumDims]int8) []uint32 {
 
 func writeIVF(
 	path string,
-	centroids [][NumDims]int8,
-	entries [][NumDims]int8,
+	centroids [][NumDims]int16,
+	entries [][NumDims]int16,
 	labels []byte,
 	assignments []uint32,
 ) error {
@@ -267,7 +269,6 @@ func writeIVF(
 		offsets[i+1] = offsets[i] + clusterCounts[i]
 	}
 
-	// fill positions, grouped by cluster
 	cursor := make([]uint32, nC)
 	copy(cursor, offsets[:nC])
 
@@ -278,9 +279,10 @@ func writeIVF(
 		cursor[c]++
 		off := int(pos) * EntrySize
 		for j := 0; j < NumDims; j++ {
-			body[off+j] = byte(entries[i][j])
+			binary.LittleEndian.PutUint16(body[off+j*2:], uint16(entries[i][j]))
 		}
-		body[off+NumDims] = labels[i]
+		body[off+DimBytes] = labels[i]
+		// body[off+DimBytes+1] = 0 (already zero, padding)
 	}
 
 	f, err := os.Create(path)
@@ -291,7 +293,7 @@ func writeIVF(
 
 	var header [HeaderSize]byte
 	binary.LittleEndian.PutUint32(header[0:4], IVFMagic)
-	binary.LittleEndian.PutUint32(header[4:8], 1)
+	binary.LittleEndian.PutUint32(header[4:8], 2)
 	binary.LittleEndian.PutUint64(header[8:16], uint64(n))
 	binary.LittleEndian.PutUint32(header[16:20], uint32(nC))
 	binary.LittleEndian.PutUint32(header[20:24], uint32(NumDims))
@@ -299,10 +301,10 @@ func writeIVF(
 		return err
 	}
 
-	centBuf := make([]byte, nC*NumDims)
+	centBuf := make([]byte, nC*DimBytes)
 	for c := 0; c < nC; c++ {
 		for j := 0; j < NumDims; j++ {
-			centBuf[c*NumDims+j] = byte(centroids[c][j])
+			binary.LittleEndian.PutUint16(centBuf[c*DimBytes+j*2:], uint16(centroids[c][j]))
 		}
 	}
 	if _, err := f.Write(centBuf); err != nil {
@@ -333,15 +335,18 @@ func labelByte(s string) byte {
 	return 0
 }
 
-func quantize(v float32) int8 {
-	if v <= -1 {
-		return -127
+// quantizeRef matches the runtime's quantizeReference: -1 sentinel -> -Scale,
+// otherwise clamp to [0,1] then round-half-away-from-zero scale by 10000.
+func quantizeRef(v float32) int16 {
+	if v <= -0.9999 {
+		return -Scale
 	}
 	if v < 0 {
 		return 0
 	}
-	if v >= 1 {
-		return 127
+	if v > 1 {
+		return Scale
 	}
-	return int8(v * 127)
+	x := v*Scale + 0.5
+	return int16(x)
 }
