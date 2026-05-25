@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"sync"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -50,13 +52,24 @@ type Response struct {
 	FraudScore float32 `json:"fraud_score"`
 }
 
+var requestPool = sync.Pool{
+	New: func() any {
+		return new(Request)
+	},
+}
+
+var (
+	pathFraudScore = []byte("/fraud-score")
+	pathReady      = []byte("/ready")
+)
+
 func handler(ctx *fasthttp.RequestCtx) {
-	switch string(ctx.Path()) {
-	case "/fraud-score":
+	path := ctx.Path()
+	if bytes.Equal(path, pathFraudScore) {
 		fraudScoreHandler(ctx)
-	case "/ready":
+	} else if bytes.Equal(path, pathReady) {
 		ctx.SetStatusCode(fasthttp.StatusOK)
-	default:
+	} else {
 		ctx.SetStatusCode(fasthttp.StatusNotFound)
 	}
 }
@@ -67,26 +80,29 @@ func fraudScoreHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	var req Request
-	if err := sonic.Unmarshal(ctx.PostBody(), &req); err != nil {
+	req := requestPool.Get().(*Request)
+	defer func() {
+		req.Id = ""
+		req.Customer.KnownMerchants = nil
+		req.LastTransaction = nil
+		requestPool.Put(req)
+	}()
+
+	if err := sonic.Unmarshal(ctx.PostBody(), req); err != nil {
 		ctx.SetStatusCode(fasthttp.StatusBadRequest)
 		return
 	}
 
-	vec := normalize(&req, cfg)
+	vec := normalize(req, cfg)
 	fraudCount := ds.FraudCountTop5(&vec)
 	score := float32(fraudCount) / 5.0
 
-	body, err := sonic.Marshal(Response{
+	res := Response{
 		Approved:   score < 0.6,
 		FraudScore: score,
-	})
-	if err != nil {
-		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
-		return
 	}
 
 	ctx.SetContentType("application/json")
 	ctx.SetStatusCode(fasthttp.StatusOK)
-	ctx.SetBody(body)
+	_ = sonic.ConfigDefault.NewEncoder(ctx).Encode(res)
 }

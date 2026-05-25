@@ -3,7 +3,6 @@ package main
 import (
 	"log"
 	"os"
-	"runtime/debug"
 	"time"
 
 	"github.com/valyala/fasthttp"
@@ -15,8 +14,6 @@ var (
 )
 
 func main() {
-	debug.SetGCPercent(50)
-
 	dataDir := envOrDefault("DATA_DIR", "/app/data")
 
 	var err error
