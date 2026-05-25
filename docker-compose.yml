@@ -12,7 +12,7 @@ services:
       resources:
         limits:
           cpus: "0.40"
-          memory: "150MB"
+          memory: "145MB"
 
   api-2:
     image: rpxc/fraud-detector-api:latest
@@ -27,7 +27,7 @@ services:
       resources:
         limits:
           cpus: "0.40"
-          memory: "150MB"
+          memory: "145MB"
 
   nginx:
     image: nginx:1.25-alpine
@@ -44,7 +44,7 @@ services:
       resources:
         limits:
           cpus: "0.20"
-          memory: "50MB"
+          memory: "40MB"
 
 networks:
   rinha-net:
