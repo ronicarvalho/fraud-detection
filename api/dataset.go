@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"sort"
 	"syscall"
 	"unsafe"
 )
@@ -19,7 +18,8 @@ const (
 	LabelFraud = 1
 	LabelLegit = 0
 	K          = 5
-	NPROBE     = 4 // small fast-path; repair() takes over when votes are ambiguous
+	NPROBE     = 8  // fast-path: more unanimous top-5s hit here, avoiding repair
+	RepairCap  = 16 // bounded repair: only scan the 16 clusters with smallest bbox lb
 )
 
 type Dataset struct {
@@ -281,15 +281,20 @@ type bboxCand struct {
 	c  uint32
 }
 
-// repair: when fast path is ambiguous, scan every other cluster, but only the
-// ones whose bbox lower bound is < current top5.maxDist. Walk candidates in
-// ascending lb order — once lb >= the (possibly tightened) max, we can stop.
+// repair: when fast path is ambiguous, run a bounded "almost-exact" pass.
+// We keep only the RepairCap clusters with smallest bbox lower bound (via a
+// max-heap fixed-size on the stack — zero allocation), sort those ascending,
+// and scan them in order. The bbox lb is a mathematically exact lower bound
+// on the distance to any vector in that cluster, so the RepairCap clusters
+// with smallest lb almost certainly contain the true top-K. Once max_top
+// tightens below a candidate's lb, we stop scanning the rest.
 func (d *Dataset) repair(query *Vector, skip [NPROBE]uint32, top *top5) {
-	// Collect candidates beating the current top
-	cands := make([]bboxCand, 0, d.nClusters)
+	var heap [RepairCap]bboxCand
+	heapSize := 0
+	worst := int64(math.MaxInt64)
 	maxTop := top.maxDist()
+
 	for c := uint32(0); c < uint32(d.nClusters); c++ {
-		// skip the already-scanned probes
 		skipped := false
 		for i := 0; i < NPROBE; i++ {
 			if skip[i] == c {
@@ -304,20 +309,64 @@ func (d *Dataset) repair(query *Vector, skip [NPROBE]uint32, top *top5) {
 			continue
 		}
 		lb := d.bboxLowerBound(c, query)
-		if lb < maxTop {
-			cands = append(cands, bboxCand{lb, c})
+		if lb >= maxTop {
+			continue
+		}
+		if heapSize < RepairCap {
+			heap[heapSize] = bboxCand{lb, c}
+			heapSize++
+			if heapSize == RepairCap {
+				for k := RepairCap/2 - 1; k >= 0; k-- {
+					siftDownCands(&heap, k, RepairCap)
+				}
+				worst = heap[0].lb
+			}
+			continue
+		}
+		if lb < worst {
+			heap[0] = bboxCand{lb, c}
+			siftDownCands(&heap, 0, RepairCap)
+			worst = heap[0].lb
 		}
 	}
 
-	sort.Slice(cands, func(i, j int) bool { return cands[i].lb < cands[j].lb })
-
-	for _, ca := range cands {
-		if ca.lb >= top.maxDist() {
-			break // top tightened past this lb; rest are no-ops
+	// Sort heap[0:heapSize] ascending by lb. Small (≤64) — insertion sort
+	// beats quicksort on this size and has zero allocation.
+	for i := 1; i < heapSize; i++ {
+		v := heap[i]
+		j := i - 1
+		for j >= 0 && heap[j].lb > v.lb {
+			heap[j+1] = heap[j]
+			j--
 		}
-		start := int(d.offsets[ca.c])
-		end := int(d.offsets[ca.c+1])
+		heap[j+1] = v
+	}
+
+	for i := 0; i < heapSize; i++ {
+		if heap[i].lb >= top.maxDist() {
+			break
+		}
+		start := int(d.offsets[heap[i].c])
+		end := int(d.offsets[heap[i].c+1])
 		d.scanRange(query, start, end, top)
+	}
+}
+
+func siftDownCands(h *[RepairCap]bboxCand, i, n int) {
+	for {
+		l := 2*i + 1
+		if l >= n {
+			return
+		}
+		max := l
+		if l+1 < n && h[l+1].lb > h[l].lb {
+			max = l + 1
+		}
+		if h[i].lb >= h[max].lb {
+			return
+		}
+		h[i], h[max] = h[max], h[i]
+		i = max
 	}
 }
 
