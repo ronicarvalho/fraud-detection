@@ -16,10 +16,10 @@ import (
 )
 
 const (
-	IVFMagic   = uint32(0x32465649) // "IVF2"
+	IVFMagic   = uint32(0x33465649) // "IVF3"
 	HeaderSize = 32
 	NumDims    = 14
-	DimBytes   = NumDims * 2 // 28
+	DimBytes   = NumDims * 2  // 28
 	EntrySize  = DimBytes + 2 // 30 (28 vector + 1 label + 1 pad)
 	Scale      = 10000
 )
@@ -74,7 +74,11 @@ func main() {
 	assignments := assignAll(entries, centroids)
 	log.Printf("assigned %d entries in %v", len(entries), time.Since(t1))
 
-	if err := writeIVF(outPath, centroids, entries, labels, assignments); err != nil {
+	t2 := time.Now()
+	bboxMin, bboxMax := computeBboxes(entries, assignments, *k)
+	log.Printf("computed bboxes in %v", time.Since(t2))
+
+	if err := writeIVF(outPath, centroids, bboxMin, bboxMax, entries, labels, assignments); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -140,7 +144,6 @@ func genSynth(n int) ([][NumDims]int16, []byte) {
 	return entries, labels
 }
 
-// trainKMeans runs mini-batch online k-means in float32 and returns int16 centroids.
 func trainKMeans(data [][NumDims]int16, k, iters, batchSize int) [][NumDims]int16 {
 	rng := rand.New(rand.NewSource(1))
 
@@ -218,7 +221,6 @@ func nearestI16(x *[NumDims]int16, centroids [][NumDims]int16) int {
 	return bestIdx
 }
 
-// assignAll computes the nearest centroid index for every entry, in parallel.
 func assignAll(data [][NumDims]int16, centroids [][NumDims]int16) []uint32 {
 	n := len(data)
 	out := make([]uint32, n)
@@ -250,9 +252,36 @@ func assignAll(data [][NumDims]int16, centroids [][NumDims]int16) []uint32 {
 	return out
 }
 
+// computeBboxes scans every entry and records per-cluster min/max for each dim.
+// Clusters with no entries get a degenerate bbox of all-zero (lb will be ~q²).
+func computeBboxes(entries [][NumDims]int16, assignments []uint32, k int) ([][NumDims]int16, [][NumDims]int16) {
+	bMin := make([][NumDims]int16, k)
+	bMax := make([][NumDims]int16, k)
+	seen := make([]bool, k)
+	for i, e := range entries {
+		c := assignments[i]
+		if !seen[c] {
+			bMin[c] = e
+			bMax[c] = e
+			seen[c] = true
+			continue
+		}
+		for j := 0; j < NumDims; j++ {
+			if e[j] < bMin[c][j] {
+				bMin[c][j] = e[j]
+			}
+			if e[j] > bMax[c][j] {
+				bMax[c][j] = e[j]
+			}
+		}
+	}
+	return bMin, bMax
+}
+
 func writeIVF(
 	path string,
 	centroids [][NumDims]int16,
+	bboxMin, bboxMax [][NumDims]int16,
 	entries [][NumDims]int16,
 	labels []byte,
 	assignments []uint32,
@@ -282,7 +311,6 @@ func writeIVF(
 			binary.LittleEndian.PutUint16(body[off+j*2:], uint16(entries[i][j]))
 		}
 		body[off+DimBytes] = labels[i]
-		// body[off+DimBytes+1] = 0 (already zero, padding)
 	}
 
 	f, err := os.Create(path)
@@ -293,7 +321,7 @@ func writeIVF(
 
 	var header [HeaderSize]byte
 	binary.LittleEndian.PutUint32(header[0:4], IVFMagic)
-	binary.LittleEndian.PutUint32(header[4:8], 2)
+	binary.LittleEndian.PutUint32(header[4:8], 3)
 	binary.LittleEndian.PutUint64(header[8:16], uint64(n))
 	binary.LittleEndian.PutUint32(header[16:20], uint32(nC))
 	binary.LittleEndian.PutUint32(header[20:24], uint32(NumDims))
@@ -301,13 +329,24 @@ func writeIVF(
 		return err
 	}
 
-	centBuf := make([]byte, nC*DimBytes)
-	for c := 0; c < nC; c++ {
-		for j := 0; j < NumDims; j++ {
-			binary.LittleEndian.PutUint16(centBuf[c*DimBytes+j*2:], uint16(centroids[c][j]))
+	writeI16Block := func(vecs [][NumDims]int16) error {
+		buf := make([]byte, nC*DimBytes)
+		for c := 0; c < nC; c++ {
+			for j := 0; j < NumDims; j++ {
+				binary.LittleEndian.PutUint16(buf[c*DimBytes+j*2:], uint16(vecs[c][j]))
+			}
 		}
+		_, err := f.Write(buf)
+		return err
 	}
-	if _, err := f.Write(centBuf); err != nil {
+
+	if err := writeI16Block(centroids); err != nil {
+		return err
+	}
+	if err := writeI16Block(bboxMin); err != nil {
+		return err
+	}
+	if err := writeI16Block(bboxMax); err != nil {
 		return err
 	}
 
@@ -323,7 +362,7 @@ func writeIVF(
 		return err
 	}
 
-	total := HeaderSize + len(centBuf) + len(offBuf) + len(body)
+	total := HeaderSize + 3*nC*DimBytes + (nC+1)*4 + n*EntrySize
 	log.Printf("wrote %d entries / %d clusters (%d bytes)", n, nC, total)
 	return nil
 }
@@ -335,8 +374,6 @@ func labelByte(s string) byte {
 	return 0
 }
 
-// quantizeRef matches the runtime's quantizeReference: -1 sentinel -> -Scale,
-// otherwise clamp to [0,1] then round-half-away-from-zero scale by 10000.
 func quantizeRef(v float32) int16 {
 	if v <= -0.9999 {
 		return -Scale

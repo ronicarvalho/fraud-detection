@@ -14,8 +14,17 @@ A API expõe `POST /fraud-score`. Para cada transação:
 
 1. **Normaliza** o payload em um vetor de 14 dimensões (ordem fixa pela spec) usando as constantes de `data/normalization.json` e o lookup de `data/mcc_risk.json`.
 2. **Quantiza** cada dimensão de `float32 [-1, 1]` para `int16 [-10000, 10000]` (o `-10000` continua significando "sem `last_transaction`"). 10 000 níveis por dimensão evitam o ruído de quantização que int8 introduzia em casos limítrofes.
-3. **Busca os 5 vizinhos mais próximos** no dataset de referência (3 milhões de vetores) usando distância euclidiana ao quadrado.
+3. **Busca os 5 vizinhos mais próximos** no dataset de referência (3 milhões de vetores) usando distância euclidiana ao quadrado, com a estratégia rápido/lento descrita abaixo.
 4. **Vota**: `fraud_score = fraud_count / 5`; `approved = fraud_score < 0.6` (literal da spec).
+
+### Estratégia rápido/lento (IVF + bbox repair)
+
+Inspirada no projeto C++ líder. Para cada query:
+
+- **Caminho rápido**: varre apenas os `NPROBE=4` clusters mais próximos da query e calcula o top-5. Se a votação é **unânime** (0 ou 5 frauds), retorna direto — caso da maioria das requests.
+- **Caminho lento (`repair`)**: quando a votação é ambígua (1–4 frauds), o algoritmo computa, para cada cluster restante, um **lower bound exato** da menor distância possível entre a query e qualquer ponto do cluster (via bounding box `min/max` por dimensão). Clusters cujo lb já é maior que o pior do top-5 são descartados; os candidatos restantes são varridos em ordem crescente de lb, encolhendo o top-5 e podando agressivamente o resto.
+
+Resultado: o KNN é praticamente exato quando importa (regiões ambíguas) e quase grátis quando não importa (votações unânimes).
 
 ## Arquitetura do índice — IVF (Inverted File)
 
@@ -31,11 +40,15 @@ Resultado: ~109× de speedup no KNN puro e p99 ~2 ms ponta-a-ponta (vs 94 ms com
 Tudo cabe em ~87 MB, mmap'ado e compartilhável entre as duas instâncias via page cache do kernel:
 
 ```
-Header (32 bytes):  magic "IVF2" | version | n_entries | n_clusters | n_dims
+Header (32 bytes):  magic "IVF3" | version | n_entries | n_clusters | n_dims
 Centroides:         n_clusters × 28 bytes (14 × int16 LE)
+BBoxMin:            n_clusters × 28 bytes (14 × int16 LE)  ← min por dim/cluster
+BBoxMax:            n_clusters × 28 bytes (14 × int16 LE)  ← max por dim/cluster
 Offsets:            (n_clusters + 1) × uint32  (início de cada cluster)
 Entries:            n_entries × 30 bytes (14×int16 + 1 byte label + 1 byte pad)
 ```
+
+Adicional sobre o IVF1/IVF2 anterior: as duas seções de bbox somam ~112 KB para 2048 clusters — trivial.
 
 ## Estrutura
 
