@@ -71,12 +71,11 @@ func normalize(r *Request, cfg *Config) Vector {
 	v[DimAmount] = quantize(clamp01(tx.Amount / cfg.MaxAmount))
 	v[DimInstallments] = quantize(clamp01(float32(tx.Installments) / cfg.MaxInstallments))
 
-	var amountVsAvg float32
-	if r.Customer.AvgAmount > 0 {
-		amountVsAvg = (tx.Amount / r.Customer.AvgAmount) / cfg.AmountVsAvgRatio
-	} else {
-		amountVsAvg = 1.0
+	avg := r.Customer.AvgAmount
+	if avg <= 0 {
+		avg = 1.0
 	}
+	amountVsAvg := (tx.Amount / avg) / cfg.AmountVsAvgRatio
 	v[DimAmountVsAvg] = quantize(clamp01(amountVsAvg))
 
 	t := tx.RequestedAt.UTC()
