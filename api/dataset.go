@@ -10,27 +10,31 @@ import (
 )
 
 const (
-	IVFMagic   = uint32(0x33465649) // "IVF3" — adds per-cluster bbox min/max
-	HeaderSize = 32
-	NumDims    = 14
-	DimBytes   = NumDims * 2  // 28
-	EntrySize  = DimBytes + 2 // 30: 14*int16 + 1 label + 1 pad
-	LabelFraud = 1
-	LabelLegit = 0
-	K          = 5
-	NPROBE     = 8  // fast-path: more unanimous top-5s hit here, avoiding repair
-	RepairCap  = 16 // bounded repair: only scan the 16 clusters with smallest bbox lb
+	IVFMagic     = uint32(0x34465649) // "IVF4" — pair-SoA blocked layout
+	HeaderSize   = 32
+	NumDims      = 14
+	NumPairs     = NumDims / 2 // 7
+	BlockSize    = 8           // entries per block (matches AVX2 lane count)
+	BlockVecSize = NumPairs * BlockSize * 2 * 2 // 224 bytes
+	LabelFraud   = 1
+	LabelLegit   = 0
+	K            = 5
+	NPROBE       = 8
+	RepairCap    = 16
 )
 
 type Dataset struct {
-	raw       []byte   // entire mmap region
-	centroids []byte   // [nClusters * DimBytes]
-	bboxMin   []byte   // [nClusters * DimBytes]
-	bboxMax   []byte   // [nClusters * DimBytes]
-	offsets   []uint32 // [nClusters + 1] start of each cluster (in entries)
-	body      []byte   // [n * EntrySize]
-	n         int
-	nClusters int
+	raw          []byte
+	centroids    []byte   // [nClusters * 28]
+	bboxMin      []byte   // [nClusters * 28]
+	bboxMax      []byte   // [nClusters * 28]
+	blockOffsets []uint32 // [nClusters + 1]
+	counts       []uint32 // [nClusters] real entry count per cluster
+	labels       []byte   // [totalBlocks * 8]
+	blocks       []byte   // [totalBlocks * 224]
+	n            int
+	nClusters    int
+	totalBlocks  int
 }
 
 func LoadDataset(path string) (*Dataset, error) {
@@ -62,40 +66,53 @@ func LoadDataset(path string) (*Dataset, error) {
 	n := int(binary.LittleEndian.Uint64(data[8:16]))
 	nClusters := int(binary.LittleEndian.Uint32(data[16:20]))
 	nDims := int(binary.LittleEndian.Uint32(data[20:24]))
+	totalBlocks := int(binary.LittleEndian.Uint32(data[24:28]))
 	if nDims != NumDims {
 		_ = syscall.Munmap(data)
 		return nil, fmt.Errorf("dims=%d, expected %d", nDims, NumDims)
 	}
 
+	dimBytes := NumDims * 2
 	centStart := HeaderSize
-	centEnd := centStart + nClusters*DimBytes
+	centEnd := centStart + nClusters*dimBytes
 	bmnStart := centEnd
-	bmnEnd := bmnStart + nClusters*DimBytes
+	bmnEnd := bmnStart + nClusters*dimBytes
 	bmxStart := bmnEnd
-	bmxEnd := bmxStart + nClusters*DimBytes
+	bmxEnd := bmxStart + nClusters*dimBytes
 	offStart := bmxEnd
 	offEnd := offStart + (nClusters+1)*4
-	bodyStart := offEnd
-	bodyEnd := bodyStart + n*EntrySize
-	if bodyEnd > size {
+	cntStart := offEnd
+	cntEnd := cntStart + nClusters*4
+	lblStart := cntEnd
+	lblEnd := lblStart + totalBlocks*BlockSize
+	blkStart := lblEnd
+	blkEnd := blkStart + totalBlocks*BlockVecSize
+	if blkEnd > size {
 		_ = syscall.Munmap(data)
-		return nil, fmt.Errorf("file size %d < expected %d", size, bodyEnd)
+		return nil, fmt.Errorf("file size %d < expected %d", size, blkEnd)
 	}
 
 	offsets := make([]uint32, nClusters+1)
 	for i := 0; i <= nClusters; i++ {
 		offsets[i] = binary.LittleEndian.Uint32(data[offStart+i*4:])
 	}
+	counts := make([]uint32, nClusters)
+	for i := 0; i < nClusters; i++ {
+		counts[i] = binary.LittleEndian.Uint32(data[cntStart+i*4:])
+	}
 
 	return &Dataset{
-		raw:       data,
-		centroids: data[centStart:centEnd],
-		bboxMin:   data[bmnStart:bmnEnd],
-		bboxMax:   data[bmxStart:bmxEnd],
-		offsets:   offsets,
-		body:      data[bodyStart:bodyEnd],
-		n:         n,
-		nClusters: nClusters,
+		raw:          data,
+		centroids:    data[centStart:centEnd],
+		bboxMin:      data[bmnStart:bmnEnd],
+		bboxMax:      data[bmxStart:bmxEnd],
+		blockOffsets: offsets,
+		counts:       counts,
+		labels:       data[lblStart:lblEnd],
+		blocks:       data[blkStart:blkEnd],
+		n:            n,
+		nClusters:    nClusters,
+		totalBlocks:  totalBlocks,
 	}, nil
 }
 
@@ -108,23 +125,26 @@ func (d *Dataset) Close() error {
 	d.centroids = nil
 	d.bboxMin = nil
 	d.bboxMax = nil
-	d.body = nil
+	d.labels = nil
+	d.blocks = nil
 	return err
 }
 
 func (d *Dataset) Len() int       { return d.n }
 func (d *Dataset) NClusters() int { return d.nClusters }
 
-// top5 keeps the K nearest neighbors in a max-heap (topDist[0] = worst kept).
+// top5 keeps the K nearest neighbors in a max-heap (dist[0] = worst kept).
+// Distances are stored as float32 to match the SIMD path (which uses
+// VCVTDQ2PS / VADDPS for accumulation, same as the C++ leader).
 type top5 struct {
-	dist   [K]int64
+	dist   [K]float32
 	label  [K]byte
 	filled int
 }
 
-func (t *top5) maxDist() int64 {
+func (t *top5) maxDist() float32 {
 	if t.filled < K {
-		return math.MaxInt64
+		return math.MaxFloat32
 	}
 	return t.dist[0]
 }
@@ -139,21 +159,35 @@ func (t *top5) fraudCount() int {
 	return n
 }
 
-// FraudScore returns n_fraud_in_top5 / 5.
-// Fast path: scan NPROBE=4 nearest clusters. If the 5 nearest neighbors are
-// unanimous (all fraud or all legit), trust the verdict. Otherwise repair():
-// scan every remaining cluster, pruning by bbox lower bound vs. current top5.
+func (t *top5) update(dist float32, label byte) {
+	if t.filled < K {
+		t.dist[t.filled] = dist
+		t.label[t.filled] = label
+		t.filled++
+		if t.filled == K {
+			for k := K/2 - 1; k >= 0; k-- {
+				siftDown(&t.dist, &t.label, k)
+			}
+		}
+		return
+	}
+	if dist < t.dist[0] {
+		t.dist[0] = dist
+		t.label[0] = label
+		siftDown(&t.dist, &t.label, 0)
+	}
+}
+
+// FraudScore implements the fast/slow path strategy:
+//   - Fast: scan NPROBE=8 nearest clusters via pair-SoA blocks.
+//   - If voting is unanimous (0 or K frauds), return.
+//   - Slow (repair): bbox lower bound prunes; scan the RepairCap clusters with smallest lb.
 func (d *Dataset) FraudScore(query *Vector) float32 {
 	probes := d.topProbes(query)
 
 	var top top5
 	for _, c := range probes {
-		start := int(d.offsets[c])
-		end := int(d.offsets[c+1])
-		if start == end {
-			continue
-		}
-		d.scanRange(query, start, end, &top)
+		d.scanCluster(c, query, &top)
 	}
 
 	fc := top.fraudCount()
@@ -168,7 +202,6 @@ func (d *Dataset) FraudScore(query *Vector) float32 {
 	return float32(top.fraudCount()) / float32(top.filled)
 }
 
-// topProbes finds the NPROBE nearest centroids to the query.
 func (d *Dataset) topProbes(query *Vector) [NPROBE]uint32 {
 	q := [NumDims]int64{
 		int64(query[0]), int64(query[1]), int64(query[2]), int64(query[3]),
@@ -184,7 +217,7 @@ func (d *Dataset) topProbes(query *Vector) [NPROBE]uint32 {
 
 	cents := d.centroids
 	for c := 0; c < d.nClusters; c++ {
-		base := unsafe.Pointer(&cents[c*DimBytes])
+		base := unsafe.Pointer(&cents[c*NumDims*2])
 		var sum int64
 		for j := 0; j < NumDims; j++ {
 			v := int64(*(*int16)(unsafe.Pointer(uintptr(base) + uintptr(j*2))))
@@ -214,51 +247,63 @@ func (d *Dataset) topProbes(query *Vector) [NPROBE]uint32 {
 	return topIdx
 }
 
-// scanRange scans entries [start, end) against the query, updating top.
-func (d *Dataset) scanRange(query *Vector, start, end int, top *top5) {
-	body := d.body
-	q := [NumDims]int64{
-		int64(query[0]), int64(query[1]), int64(query[2]), int64(query[3]),
-		int64(query[4]), int64(query[5]), int64(query[6]), int64(query[7]),
-		int64(query[8]), int64(query[9]), int64(query[10]), int64(query[11]),
-		int64(query[12]), int64(query[13]),
+// scanCluster scans every block of cluster c, updating top with the 8 lane
+// distances. Uses dist8Scalar (or AVX2 once Fase 2 is in).
+func (d *Dataset) scanCluster(c uint32, query *Vector, top *top5) {
+	cnt := d.counts[c]
+	if cnt == 0 {
+		return
 	}
+	blkStart := d.blockOffsets[c]
+	blkEnd := d.blockOffsets[c+1]
 
-	for i := start; i < end; i++ {
-		off := i * EntrySize
-		base := unsafe.Pointer(&body[off])
-		var sum int64
-		for j := 0; j < NumDims; j++ {
-			v := int64(*(*int16)(unsafe.Pointer(uintptr(base) + uintptr(j*2))))
-			diff := q[j] - v
-			sum += diff * diff
-		}
-		label := body[off+DimBytes]
+	var dists [BlockSize]float32
+	for bi := blkStart; bi < blkEnd; bi++ {
+		blockPtr := unsafe.Pointer(&d.blocks[uintptr(bi)*uintptr(BlockVecSize)])
+		labelPtr := unsafe.Pointer(&d.labels[uintptr(bi)*uintptr(BlockSize)])
 
-		if top.filled < K {
-			top.dist[top.filled] = sum
-			top.label[top.filled] = label
-			top.filled++
-			if top.filled == K {
-				for k := K/2 - 1; k >= 0; k-- {
-					siftDown(&top.dist, &top.label, k)
-				}
-			}
-			continue
+		dist8Scalar(query, blockPtr, &dists)
+
+		posInCluster := (bi - blkStart) * BlockSize
+		var nValid uint32
+		if posInCluster+BlockSize > cnt {
+			nValid = cnt - posInCluster
+		} else {
+			nValid = BlockSize
 		}
-		if sum < top.dist[0] {
-			top.dist[0] = sum
-			top.label[0] = label
-			siftDown(&top.dist, &top.label, 0)
+
+		for lane := uint32(0); lane < nValid; lane++ {
+			label := *(*byte)(unsafe.Pointer(uintptr(labelPtr) + uintptr(lane)))
+			top.update(dists[lane], label)
 		}
 	}
 }
 
-// bboxLowerBound returns the minimum possible squared distance from query to
-// any vector in cluster c, using its per-dimension bbox.
-func (d *Dataset) bboxLowerBound(c uint32, q *Vector) int64 {
-	mnBase := unsafe.Pointer(&d.bboxMin[uintptr(c)*uintptr(DimBytes)])
-	mxBase := unsafe.Pointer(&d.bboxMax[uintptr(c)*uintptr(DimBytes)])
+// dist8Scalar computes squared euclidean distance between `q` and 8 vectors
+// stored pair-SoA inside `blockPtr` (224 bytes). Acumulação em float32 para
+// match bit-a-bit com dist8AVX2 (Fase 2).
+func dist8Scalar(q *Vector, blockPtr unsafe.Pointer, out *[BlockSize]float32) {
+	var sums [BlockSize]float32
+	for p := 0; p < NumPairs; p++ {
+		q0 := int32(q[p*2])
+		q1 := int32(q[p*2+1])
+		pairOff := p * BlockSize * 4 // 32 bytes per pair group
+		for lane := 0; lane < BlockSize; lane++ {
+			laneOff := pairOff + lane*4
+			v0 := int32(*(*int16)(unsafe.Add(blockPtr, laneOff)))
+			v1 := int32(*(*int16)(unsafe.Add(blockPtr, laneOff+2)))
+			d0 := q0 - v0
+			d1 := q1 - v1
+			// VPMADDWD semantics: (d0*d0 + d1*d1) in int32, then converted to float32 and added.
+			sums[lane] += float32(d0*d0 + d1*d1)
+		}
+	}
+	*out = sums
+}
+
+func (d *Dataset) bboxLowerBound(c uint32, q *Vector) float32 {
+	mnBase := unsafe.Pointer(&d.bboxMin[uintptr(c)*uintptr(NumDims*2)])
+	mxBase := unsafe.Pointer(&d.bboxMax[uintptr(c)*uintptr(NumDims*2)])
 	var sum int64
 	for j := 0; j < NumDims; j++ {
 		qv := int64(q[j])
@@ -273,25 +318,18 @@ func (d *Dataset) bboxLowerBound(c uint32, q *Vector) int64 {
 		}
 		sum += gap * gap
 	}
-	return sum
+	return float32(sum)
 }
 
 type bboxCand struct {
-	lb int64
+	lb float32
 	c  uint32
 }
 
-// repair: when fast path is ambiguous, run a bounded "almost-exact" pass.
-// We keep only the RepairCap clusters with smallest bbox lower bound (via a
-// max-heap fixed-size on the stack — zero allocation), sort those ascending,
-// and scan them in order. The bbox lb is a mathematically exact lower bound
-// on the distance to any vector in that cluster, so the RepairCap clusters
-// with smallest lb almost certainly contain the true top-K. Once max_top
-// tightens below a candidate's lb, we stop scanning the rest.
 func (d *Dataset) repair(query *Vector, skip [NPROBE]uint32, top *top5) {
 	var heap [RepairCap]bboxCand
 	heapSize := 0
-	worst := int64(math.MaxInt64)
+	worst := float32(math.MaxFloat32)
 	maxTop := top.maxDist()
 
 	for c := uint32(0); c < uint32(d.nClusters); c++ {
@@ -305,7 +343,7 @@ func (d *Dataset) repair(query *Vector, skip [NPROBE]uint32, top *top5) {
 		if skipped {
 			continue
 		}
-		if d.offsets[c] == d.offsets[c+1] {
+		if d.counts[c] == 0 {
 			continue
 		}
 		lb := d.bboxLowerBound(c, query)
@@ -330,8 +368,6 @@ func (d *Dataset) repair(query *Vector, skip [NPROBE]uint32, top *top5) {
 		}
 	}
 
-	// Sort heap[0:heapSize] ascending by lb. Small (≤64) — insertion sort
-	// beats quicksort on this size and has zero allocation.
 	for i := 1; i < heapSize; i++ {
 		v := heap[i]
 		j := i - 1
@@ -346,31 +382,11 @@ func (d *Dataset) repair(query *Vector, skip [NPROBE]uint32, top *top5) {
 		if heap[i].lb >= top.maxDist() {
 			break
 		}
-		start := int(d.offsets[heap[i].c])
-		end := int(d.offsets[heap[i].c+1])
-		d.scanRange(query, start, end, top)
+		d.scanCluster(heap[i].c, query, top)
 	}
 }
 
-func siftDownCands(h *[RepairCap]bboxCand, i, n int) {
-	for {
-		l := 2*i + 1
-		if l >= n {
-			return
-		}
-		max := l
-		if l+1 < n && h[l+1].lb > h[l].lb {
-			max = l + 1
-		}
-		if h[i].lb >= h[max].lb {
-			return
-		}
-		h[i], h[max] = h[max], h[i]
-		i = max
-	}
-}
-
-func siftDown(dist *[K]int64, label *[K]byte, i int) {
+func siftDown(dist *[K]float32, label *[K]byte, i int) {
 	for {
 		l := 2*i + 1
 		if l >= K {
@@ -404,6 +420,24 @@ func siftDownProbes(dist *[NPROBE]int64, idx *[NPROBE]uint32, i int) {
 		}
 		dist[i], dist[max] = dist[max], dist[i]
 		idx[i], idx[max] = idx[max], idx[i]
+		i = max
+	}
+}
+
+func siftDownCands(h *[RepairCap]bboxCand, i, n int) {
+	for {
+		l := 2*i + 1
+		if l >= n {
+			return
+		}
+		max := l
+		if l+1 < n && h[l+1].lb > h[l].lb {
+			max = l + 1
+		}
+		if h[i].lb >= h[max].lb {
+			return
+		}
+		h[i], h[max] = h[max], h[i]
 		i = max
 	}
 }

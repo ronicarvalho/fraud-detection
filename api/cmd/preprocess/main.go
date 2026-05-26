@@ -16,12 +16,14 @@ import (
 )
 
 const (
-	IVFMagic   = uint32(0x33465649) // "IVF3"
-	HeaderSize = 32
-	NumDims    = 14
-	DimBytes   = NumDims * 2  // 28
-	EntrySize  = DimBytes + 2 // 30 (28 vector + 1 label + 1 pad)
-	Scale      = 10000
+	IVFMagic     = uint32(0x34465649) // "IVF4" — pair-SoA blocked layout
+	HeaderSize   = 32
+	NumDims      = 14
+	NumPairs     = NumDims / 2 // 7
+	Scale        = 10000
+	BlockSize    = 8                                  // entries per block (matches AVX2 lane count)
+	BlockBytes   = NumPairs*BlockSize*2*2 + BlockSize // 7*16*2 + 8 = 232 bytes (vectors + labels)
+	BlockVecSize = NumPairs * BlockSize * 2 * 2       // 224
 )
 
 type refEntry struct {
@@ -252,8 +254,6 @@ func assignAll(data [][NumDims]int16, centroids [][NumDims]int16) []uint32 {
 	return out
 }
 
-// computeBboxes scans every entry and records per-cluster min/max for each dim.
-// Clusters with no entries get a degenerate bbox of all-zero (lb will be ~q²).
 func computeBboxes(entries [][NumDims]int16, assignments []uint32, k int) ([][NumDims]int16, [][NumDims]int16) {
 	bMin := make([][NumDims]int16, k)
 	bMax := make([][NumDims]int16, k)
@@ -278,6 +278,16 @@ func computeBboxes(entries [][NumDims]int16, assignments []uint32, k int) ([][Nu
 	return bMin, bMax
 }
 
+// writeIVF emits the IVF4 binary:
+//
+//	Header(32)
+//	Centroids[nC][14] int16
+//	BBoxMin[nC][14] int16
+//	BBoxMax[nC][14] int16
+//	BlockOffsets[nC+1] uint32   (offset in BLOCKS, not entries)
+//	EntryCounts[nC]    uint32   (real entry count per cluster)
+//	Labels[totalBlocks*8] uint8
+//	Blocks[totalBlocks * 224 bytes]  (pair-SoA: 7 pairs × 8 lanes × 2 dims × 2 bytes)
 func writeIVF(
 	path string,
 	centroids [][NumDims]int16,
@@ -289,28 +299,70 @@ func writeIVF(
 	nC := len(centroids)
 	n := len(entries)
 
-	clusterCounts := make([]uint32, nC)
+	// Group entries by cluster
+	counts := make([]uint32, nC)
 	for _, a := range assignments {
-		clusterCounts[a]++
-	}
-	offsets := make([]uint32, nC+1)
-	for i := 0; i < nC; i++ {
-		offsets[i+1] = offsets[i] + clusterCounts[i]
+		counts[a]++
 	}
 
-	cursor := make([]uint32, nC)
-	copy(cursor, offsets[:nC])
+	clusterEntries := make([][]uint32, nC)
+	for c := 0; c < nC; c++ {
+		clusterEntries[c] = make([]uint32, 0, counts[c])
+	}
+	for i, a := range assignments {
+		clusterEntries[a] = append(clusterEntries[a], uint32(i))
+	}
 
-	body := make([]byte, n*EntrySize)
-	for i := 0; i < n; i++ {
-		c := assignments[i]
-		pos := cursor[c]
-		cursor[c]++
-		off := int(pos) * EntrySize
-		for j := 0; j < NumDims; j++ {
-			binary.LittleEndian.PutUint16(body[off+j*2:], uint16(entries[i][j]))
+	// Compute block layout
+	blockOffsets := make([]uint32, nC+1)
+	for c := 0; c < nC; c++ {
+		nBlocks := (counts[c] + BlockSize - 1) / BlockSize
+		blockOffsets[c+1] = blockOffsets[c] + nBlocks
+	}
+	totalBlocks := blockOffsets[nC]
+
+	// Build labels and blocks
+	labelsBuf := make([]byte, totalBlocks*BlockSize)
+	blocksBuf := make([]byte, uint64(totalBlocks)*uint64(BlockVecSize))
+
+	for c := 0; c < nC; c++ {
+		idxs := clusterEntries[c]
+		blkStart := blockOffsets[c]
+		for bi := uint32(0); bi < blockOffsets[c+1]-blkStart; bi++ {
+			blockIdx := blkStart + bi
+			blockOff := uint64(blockIdx) * uint64(BlockVecSize)
+			labelOff := uint64(blockIdx) * BlockSize
+
+			for lane := 0; lane < BlockSize; lane++ {
+				ePos := int(bi)*BlockSize + lane
+				if ePos < len(idxs) {
+					eIdx := idxs[ePos]
+					e := entries[eIdx]
+					// Write 7 pairs × 16 bytes (lane × 2 int16) into pair-SoA layout.
+					// Pair p, lane L: bytes [p*32 + L*4 .. p*32 + L*4 + 3] = [e[2p].lo, e[2p].hi, e[2p+1].lo, e[2p+1].hi]
+					for p := 0; p < NumPairs; p++ {
+						pairOff := blockOff + uint64(p*BlockSize*2*2) + uint64(lane*4)
+						binary.LittleEndian.PutUint16(blocksBuf[pairOff:], uint16(e[p*2]))
+						binary.LittleEndian.PutUint16(blocksBuf[pairOff+2:], uint16(e[p*2+1]))
+					}
+					labelsBuf[labelOff+uint64(lane)] = labels[eIdx]
+				} else {
+					// Padding: a "very far" sentinel vector. Distance to query will be huge,
+					// guaranteeing the slot is never picked. Label byte is 0xFF (won't be
+					// counted because we cap iteration at counts[c]).
+					for p := 0; p < NumPairs; p++ {
+						pairOff := blockOff + uint64(p*BlockSize*2*2) + uint64(lane*4)
+						// Use Scale*2 (= 20000) which is the maximum possible coordinate distance
+						// from any valid value in [-Scale, +Scale].
+						padHi := int16(Scale)
+						padLo := int16(-Scale)
+						binary.LittleEndian.PutUint16(blocksBuf[pairOff:], uint16(padHi))
+						binary.LittleEndian.PutUint16(blocksBuf[pairOff+2:], uint16(padLo))
+					}
+					labelsBuf[labelOff+uint64(lane)] = 0xFF
+				}
+			}
 		}
-		body[off+DimBytes] = labels[i]
 	}
 
 	f, err := os.Create(path)
@@ -321,19 +373,20 @@ func writeIVF(
 
 	var header [HeaderSize]byte
 	binary.LittleEndian.PutUint32(header[0:4], IVFMagic)
-	binary.LittleEndian.PutUint32(header[4:8], 3)
+	binary.LittleEndian.PutUint32(header[4:8], 4)
 	binary.LittleEndian.PutUint64(header[8:16], uint64(n))
 	binary.LittleEndian.PutUint32(header[16:20], uint32(nC))
 	binary.LittleEndian.PutUint32(header[20:24], uint32(NumDims))
+	binary.LittleEndian.PutUint32(header[24:28], totalBlocks)
 	if _, err := f.Write(header[:]); err != nil {
 		return err
 	}
 
 	writeI16Block := func(vecs [][NumDims]int16) error {
-		buf := make([]byte, nC*DimBytes)
+		buf := make([]byte, nC*NumDims*2)
 		for c := 0; c < nC; c++ {
 			for j := 0; j < NumDims; j++ {
-				binary.LittleEndian.PutUint16(buf[c*DimBytes+j*2:], uint16(vecs[c][j]))
+				binary.LittleEndian.PutUint16(buf[(c*NumDims+j)*2:], uint16(vecs[c][j]))
 			}
 		}
 		_, err := f.Write(buf)
@@ -352,18 +405,30 @@ func writeIVF(
 
 	offBuf := make([]byte, (nC+1)*4)
 	for i := 0; i <= nC; i++ {
-		binary.LittleEndian.PutUint32(offBuf[i*4:], offsets[i])
+		binary.LittleEndian.PutUint32(offBuf[i*4:], blockOffsets[i])
 	}
 	if _, err := f.Write(offBuf); err != nil {
 		return err
 	}
 
-	if _, err := f.Write(body); err != nil {
+	countBuf := make([]byte, nC*4)
+	for i := 0; i < nC; i++ {
+		binary.LittleEndian.PutUint32(countBuf[i*4:], counts[i])
+	}
+	if _, err := f.Write(countBuf); err != nil {
 		return err
 	}
 
-	total := HeaderSize + 3*nC*DimBytes + (nC+1)*4 + n*EntrySize
-	log.Printf("wrote %d entries / %d clusters (%d bytes)", n, nC, total)
+	if _, err := f.Write(labelsBuf); err != nil {
+		return err
+	}
+
+	if _, err := f.Write(blocksBuf); err != nil {
+		return err
+	}
+
+	total := HeaderSize + 3*nC*NumDims*2 + (nC+1)*4 + nC*4 + len(labelsBuf) + len(blocksBuf)
+	log.Printf("wrote %d entries / %d clusters / %d blocks (%d bytes)", n, nC, totalBlocks, total)
 	return nil
 }
 
