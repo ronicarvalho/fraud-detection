@@ -1,6 +1,6 @@
 services:
   api-1:
-    image: rpxc/fraud-detector-api:04fc28e
+    image: rpxc/fraud-detector-api:a1079f3
     environment:
       - INSTANCE_ID=1
       - GOMAXPROCS=1
@@ -15,7 +15,7 @@ services:
           memory: "145MB"
 
   api-2:
-    image: rpxc/fraud-detector-api:04fc28e
+    image: rpxc/fraud-detector-api:a1079f3
     environment:
       - INSTANCE_ID=2
       - GOMAXPROCS=1
