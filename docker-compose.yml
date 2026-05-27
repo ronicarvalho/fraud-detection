@@ -1,7 +1,6 @@
 services:
   api-1:
     image: rpxc/fraud-detector-api:latest
-    cpuset: "0"
     environment:
       - INSTANCE_ID=1
       - GOMAXPROCS=1
@@ -27,7 +26,6 @@ services:
 
   api-2:
     image: rpxc/fraud-detector-api:latest
-    cpuset: "1"
     environment:
       - INSTANCE_ID=2
       - GOMAXPROCS=1
@@ -53,13 +51,14 @@ services:
 
   lb:
     image: rpxc/fraud-detector-lb:latest
-    cpuset: "0,1"
     ports:
       - "9999:9999"
     environment:
       - FD_LB_ADDR=0.0.0.0:9999
       - FD_TARGET_1=/sockets/api1.sock
       - FD_TARGET_2=/sockets/api2.sock
+      - FD_LB_CONNECT_RETRIES=12000
+      - FD_LB_CONNECT_SLEEP_MS=10
     volumes:
       - sockets:/sockets
     depends_on:
