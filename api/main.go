@@ -43,18 +43,6 @@ func main() {
 		TCPKeepalive:       true,
 	}
 
-	if path := os.Getenv("FD_CONTROL_SOCKET"); path != "" {
-		ln, err := newFDPassListener(path)
-		if err != nil {
-			log.Fatalf("fd-pass listener: %v", err)
-		}
-		log.Printf("api instance %s ready: fd-pass control on %s", instanceID, path)
-		if err := server.Serve(ln); err != nil {
-			log.Fatalf("server: %v", err)
-		}
-		return
-	}
-
 	if err := server.ListenAndServe(":8080"); err != nil {
 		log.Fatalf("server: %v", err)
 	}
