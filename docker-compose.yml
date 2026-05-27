@@ -1,6 +1,7 @@
 services:
   api-1:
     image: rpxc/fraud-detector-api:latest
+    platform: linux/amd64
     environment:
       - INSTANCE_ID=1
       - GOMAXPROCS=1
@@ -12,8 +13,6 @@ services:
       - sockets:/sockets
     networks:
       - rinha-net
-    security_opt:
-      - seccomp=unconfined
     ulimits:
       nofile:
         soft: 65535
@@ -26,6 +25,7 @@ services:
 
   api-2:
     image: rpxc/fraud-detector-api:latest
+    platform: linux/amd64
     environment:
       - INSTANCE_ID=2
       - GOMAXPROCS=1
@@ -37,8 +37,6 @@ services:
       - sockets:/sockets
     networks:
       - rinha-net
-    security_opt:
-      - seccomp=unconfined
     ulimits:
       nofile:
         soft: 65535
@@ -51,6 +49,7 @@ services:
 
   lb:
     image: rpxc/fraud-detector-lb:latest
+    platform: linux/amd64
     ports:
       - "9999:9999"
     environment:
@@ -66,8 +65,6 @@ services:
       - api-2
     networks:
       - rinha-net
-    security_opt:
-      - seccomp=unconfined
     ulimits:
       nofile:
         soft: 65535
@@ -84,8 +81,3 @@ networks:
 
 volumes:
   sockets:
-    driver: local
-    driver_opts:
-      type: tmpfs
-      device: tmpfs
-      o: "size=4m,mode=0777"
