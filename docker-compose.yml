@@ -1,16 +1,24 @@
 services:
   api-1:
-    image: rpxc/fraud-detector-api:ad312c2
+    image: rpxc/fraud-detector-api:latest
+    cpuset: "0"
     environment:
       - INSTANCE_ID=1
       - GOMAXPROCS=1
       - GOMEMLIMIT=140MiB
-      - GOGC=150
+      - GOGC=500
+      - GC_MODE=off
       - FD_CONTROL_SOCKET=/sockets/api1.sock
     volumes:
       - sockets:/sockets
     networks:
       - rinha-net
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     deploy:
       resources:
         limits:
@@ -18,17 +26,25 @@ services:
           memory: "150MB"
 
   api-2:
-    image: rpxc/fraud-detector-api:ad312c2
+    image: rpxc/fraud-detector-api:latest
+    cpuset: "1"
     environment:
       - INSTANCE_ID=2
       - GOMAXPROCS=1
       - GOMEMLIMIT=140MiB
-      - GOGC=150
+      - GOGC=500
+      - GC_MODE=off
       - FD_CONTROL_SOCKET=/sockets/api2.sock
     volumes:
       - sockets:/sockets
     networks:
       - rinha-net
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     deploy:
       resources:
         limits:
@@ -36,7 +52,8 @@ services:
           memory: "150MB"
 
   lb:
-    image: rpxc/fraud-detector-lb:ad312c2
+    image: rpxc/fraud-detector-lb:latest
+    cpuset: "0,1"
     ports:
       - "9999:9999"
     environment:
@@ -50,6 +67,12 @@ services:
       - api-2
     networks:
       - rinha-net
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     deploy:
       resources:
         limits:
