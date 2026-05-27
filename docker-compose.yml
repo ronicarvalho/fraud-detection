@@ -1,40 +1,50 @@
 services:
   api-1:
-    image: rpxc/fraud-detector-api:04fc28e
+    image: rpxc/fraud-detector-api:ad312c2
     environment:
       - INSTANCE_ID=1
       - GOMAXPROCS=1
       - GOMEMLIMIT=140MiB
       - GOGC=150
+      - FD_CONTROL_SOCKET=/sockets/api1.sock
+    volumes:
+      - sockets:/sockets
     networks:
       - rinha-net
     deploy:
       resources:
         limits:
-          cpus: "0.40"
-          memory: "145MB"
+          cpus: "0.45"
+          memory: "150MB"
 
   api-2:
-    image: rpxc/fraud-detector-api:04fc28e
+    image: rpxc/fraud-detector-api:ad312c2
     environment:
       - INSTANCE_ID=2
       - GOMAXPROCS=1
       - GOMEMLIMIT=140MiB
       - GOGC=150
+      - FD_CONTROL_SOCKET=/sockets/api2.sock
+    volumes:
+      - sockets:/sockets
     networks:
       - rinha-net
     deploy:
       resources:
         limits:
-          cpus: "0.40"
-          memory: "145MB"
+          cpus: "0.45"
+          memory: "150MB"
 
-  nginx:
-    image: nginx:1.25-alpine
+  lb:
+    image: rpxc/fraud-detector-lb:ad312c2
     ports:
       - "9999:9999"
+    environment:
+      - FD_LB_ADDR=0.0.0.0:9999
+      - FD_TARGET_1=/sockets/api1.sock
+      - FD_TARGET_2=/sockets/api2.sock
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - sockets:/sockets
     depends_on:
       - api-1
       - api-2
@@ -43,9 +53,17 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.20"
-          memory: "45MB"
+          cpus: "0.10"
+          memory: "30MB"
 
 networks:
   rinha-net:
     driver: bridge
+
+volumes:
+  sockets:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=4m,mode=0777"

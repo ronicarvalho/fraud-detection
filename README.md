@@ -5,8 +5,8 @@ Submissão para o desafio [Rinha de Backend 2026 — Fraud Detection via Vector 
 ## Stack
 
 - **Go 1.23** + [fasthttp](https://github.com/valyala/fasthttp) (servidor) + [sonic](https://github.com/bytedance/sonic) (JSON).
-- **nginx** como load balancer round-robin na porta 9999.
-- 2 instâncias da API + nginx, somando 1.0 CPU e 350 MB.
+- **fd-passing LB em C** (`lb/fd_lb.c`): aceita TCP em :9999, transfere o file descriptor para os services via `SCM_RIGHTS` sobre Unix socket. As APIs respondem direto ao cliente — o LB não está no caminho do dado.
+- 2 instâncias da API + LB, somando 1.0 CPU e 350 MB.
 
 ## Como funciona a detecção
 
