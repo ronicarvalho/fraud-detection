@@ -262,7 +262,7 @@ func (d *Dataset) scanCluster(c uint32, query *Vector, top *top5) {
 		blockPtr := unsafe.Pointer(&d.blocks[uintptr(bi)*uintptr(BlockVecSize)])
 		labelPtr := unsafe.Pointer(&d.labels[uintptr(bi)*uintptr(BlockSize)])
 
-		dist8(query, blockPtr, &dists)
+		dist8Scalar(query, blockPtr, &dists)
 
 		posInCluster := (bi - blkStart) * BlockSize
 		var nValid uint32

@@ -9,7 +9,6 @@ COMMIT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "manual-$(date +%s)"
 docker buildx build \
   --platform linux/amd64 \
   --no-cache \
-  -t rpxc/fraud-detector-api:latest \
   -t "rpxc/fraud-detector-api:${COMMIT_SHA}" \
   -f api/Dockerfile \
   --push \
@@ -17,7 +16,6 @@ docker buildx build \
 
 echo
 echo "Pushed:"
-echo "  rpxc/fraud-detector-api:latest"
 echo "  rpxc/fraud-detector-api:${COMMIT_SHA}"
 echo
 echo "Para forçar o avaliador a usar a versão nova, no repo da branch submissão:"
