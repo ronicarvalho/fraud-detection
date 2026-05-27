@@ -1,83 +1,51 @@
 services:
   api-1:
     image: rpxc/fraud-detector-api:latest
-    platform: linux/amd64
     environment:
       - INSTANCE_ID=1
       - GOMAXPROCS=1
       - GOMEMLIMIT=140MiB
-      - GOGC=500
-      - GC_MODE=off
-      - FD_CONTROL_SOCKET=/sockets/api1.sock
-    volumes:
-      - sockets:/sockets
+      - GOGC=150
     networks:
       - rinha-net
-    ulimits:
-      nofile:
-        soft: 65535
-        hard: 65535
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.40"
           memory: "150MB"
 
   api-2:
     image: rpxc/fraud-detector-api:latest
-    platform: linux/amd64
     environment:
       - INSTANCE_ID=2
       - GOMAXPROCS=1
       - GOMEMLIMIT=140MiB
-      - GOGC=500
-      - GC_MODE=off
-      - FD_CONTROL_SOCKET=/sockets/api2.sock
-    volumes:
-      - sockets:/sockets
+      - GOGC=150
     networks:
       - rinha-net
-    ulimits:
-      nofile:
-        soft: 65535
-        hard: 65535
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.40"
           memory: "150MB"
 
-  lb:
-    image: rpxc/fraud-detector-lb:latest
-    platform: linux/amd64
+  nginx:
+    image: nginx:1.25-alpine
     ports:
       - "9999:9999"
-    environment:
-      - FD_LB_ADDR=0.0.0.0:9999
-      - FD_TARGET_1=/sockets/api1.sock
-      - FD_TARGET_2=/sockets/api2.sock
-      - FD_LB_CONNECT_RETRIES=12000
-      - FD_LB_CONNECT_SLEEP_MS=10
     volumes:
-      - sockets:/sockets
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
       - api-1
       - api-2
     networks:
       - rinha-net
-    ulimits:
-      nofile:
-        soft: 65535
-        hard: 65535
     deploy:
       resources:
         limits:
-          cpus: "0.10"
-          memory: "30MB"
+          cpus: "0.20"
+          memory: "50MB"
 
 networks:
   rinha-net:
     driver: bridge
-
-volumes:
-  sockets:
