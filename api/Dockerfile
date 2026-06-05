@@ -17,11 +17,11 @@ RUN if [ -f /input/references.json.gz ]; then \
       preprocess -synth 100000 /work/references.bin; \
     fi
 
-FROM gcr.io/distroless/static:nonroot
+FROM alpine:3.19
 WORKDIR /app
 COPY --from=builder /out/api /app/api
 COPY --from=dataset /work/references.bin /app/data/references.bin
 COPY data/mcc_risk.json data/normalization.json /app/data/
-EXPOSE 8080
-USER nonroot:nonroot
+# Ensure /sockets exists if not mounted
+RUN mkdir -p /sockets
 ENTRYPOINT ["/app/api"]

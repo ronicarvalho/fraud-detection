@@ -9,6 +9,7 @@ COMMIT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "manual-$(date +%s)"
 docker buildx build \
   --platform linux/amd64 \
   --no-cache \
+  -t "rpxc/fraud-detector-api:latest" \
   -t "rpxc/fraud-detector-api:${COMMIT_SHA}" \
   -f api/Dockerfile \
   --push \

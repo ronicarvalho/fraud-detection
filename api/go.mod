@@ -5,6 +5,7 @@ go 1.22
 require (
 	github.com/bytedance/sonic v1.12.0
 	github.com/valyala/fasthttp v1.55.0
+	golang.org/x/sys v0.21.0
 )
 
 require (
